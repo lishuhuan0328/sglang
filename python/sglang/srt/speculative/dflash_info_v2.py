@@ -41,6 +41,9 @@ class DFlashDraftInputV2(SpecInput):
     bonus_tokens: torch.Tensor
     new_seq_lens: torch.Tensor
     hidden_states: torch.Tensor
+    # Populated only by a disaggregated Target after remote Draft completion.
+    # Shape: [bs, block_size], including the slot-0 bonus token.
+    draft_tokens: Optional[torch.Tensor] = None
     max_top_k: int = 1
     uniform_top_k_value: Optional[int] = None
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -59,8 +62,10 @@ class DFlashDraftInputV2(SpecInput):
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
         # Spec v2 draft state itself does not change token accounting.
-        self.num_tokens_per_req = 1
-        self.num_tokens_for_logprob_per_req = 1
+        draft_tokens = int(get_server_args().speculative_num_draft_tokens or 0)
+        # DFLASH internal block has an extra slot-0 bonus token.
+        self.num_tokens_per_req = draft_tokens + 1
+        self.num_tokens_for_logprob_per_req = draft_tokens
 
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
@@ -134,7 +139,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_server_args().speculative_num_draft_tokens)
+        block_size = int(get_server_args().speculative_num_draft_tokens) + 1
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
@@ -226,6 +231,12 @@ class DFlashDraftInputV2(SpecInput):
                 ]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
+        # ``future_indices`` only replaces the relay-owned bonus/hidden state.
+        # Remote DFLASH candidates are batch-owned and must follow every
+        # scheduler filter even while the relay is pending.
+        if self.draft_tokens is not None:
+            self.draft_tokens = self.draft_tokens[new_indices]
+
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -246,6 +257,18 @@ class DFlashDraftInputV2(SpecInput):
         elif spec_info.reserved_seq_lens_cpu is not None:
             self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
             self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+
+        # ``draft_tokens`` are not published through FutureMap.  Merge them
+        # before the future-indices fast path so candidates stay row-aligned
+        # with req_pool_indices under continuous batching.
+        if self.draft_tokens is None and spec_info.draft_tokens is not None:
+            raise ValueError("cannot merge local and remote DFLASH draft inputs")
+        if self.draft_tokens is not None and spec_info.draft_tokens is None:
+            raise ValueError("cannot merge remote and local DFLASH draft inputs")
+        if self.draft_tokens is not None:
+            self.draft_tokens = torch.cat(
+                [self.draft_tokens, spec_info.draft_tokens], dim=0
+            )
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
