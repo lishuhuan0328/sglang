@@ -205,21 +205,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(draft_config.resolve_block_size(default=16))
+            self.speculative_num_draft_tokens = int(
+                draft_config.resolve_block_size(default=16)
+            )
         else:
-            self.block_size = int(server_args.speculative_num_draft_tokens)
+            self.speculative_num_draft_tokens = int(
+                server_args.speculative_num_draft_tokens
+            )
             model_block_size = draft_config.block_size
             if model_block_size is None:
                 model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
+            if (
+                model_block_size is not None
+                and int(model_block_size)
+                != int(self.speculative_num_draft_tokens)
             ):
                 logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
+                    "DFLASH draft token count mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
+                    self.speculative_num_draft_tokens,
                     model_block_size,
                 )
-        self.speculative_num_draft_tokens = int(self.block_size)
+
+        # Internal DFLASH block includes slot-0 bonus token.
+        # slot 0: bonus/current token
+        # slot 1..N: speculative draft tokens
+        self.block_size = int(self.speculative_num_draft_tokens) + 1
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -259,7 +269,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.block_size), device=self.device
+            draft_token_num=int(self.speculative_num_draft_tokens), device=self.device
         )
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
@@ -1484,7 +1494,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.block_size),
+                speculative_num_draft_tokens=int(self.speculative_num_draft_tokens),
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
 
@@ -1551,7 +1561,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     start_offset=prefix_lens,
                     end_offset=end_offset,
                     batch_size=bs,
-                    draft_token_num=block_size,
+                    draft_token_num=block_size - 1,
                     device=device,
                 )
                 verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
@@ -1570,7 +1580,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start_offset=prefix_lens,
                 end_offset=end_offset,
                 batch_size=bs,
-                draft_token_num=block_size,
+                draft_token_num=block_size - 1,
                 device=device,
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
@@ -1672,7 +1682,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=positions,
-            draft_token_num=int(self.block_size),
+            draft_token_num=int(self.speculative_num_draft_tokens),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
@@ -1723,7 +1733,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=int(self.block_size),
+                draft_token_num=int(self.speculative_num_draft_tokens),
             )
 
         # Constrain every chain position before accept picks from it.
@@ -1889,7 +1899,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            speculative_num_draft_tokens=int(self.block_size),
+            speculative_num_draft_tokens=int(self.speculative_num_draft_tokens),
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
